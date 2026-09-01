@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
 
   schedule:
-    # هر دوشنبه ساعت 03:00 UTC
     - cron: "0 3 * * 1"
 
 permissions:
@@ -25,8 +24,11 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Show available disk space
-        run: df -h
+      - name: Show disk information
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -h
 
       - name: Download IMDb datasets
         shell: bash
@@ -35,50 +37,28 @@ jobs:
 
           mkdir -p datasets
 
-          curl \
-            --fail \
-            --location \
-            --retry 5 \
-            --retry-delay 10 \
-            --output datasets/title.basics.tsv.gz \
-            https://datasets.imdbws.com/title.basics.tsv.gz
+          download() {
+            local name="$1"
 
-          curl \
-            --fail \
-            --location \
-            --retry 5 \
-            --retry-delay 10 \
-            --output datasets/title.episode.tsv.gz \
-            https://datasets.imdbws.com/title.episode.tsv.gz
+            curl \
+              --fail \
+              --location \
+              --retry 5 \
+              --retry-delay 10 \
+              --output "datasets/${name}.gz" \
+              "https://datasets.imdbws.com/${name}.gz"
+          }
 
-          curl \
-            --fail \
-            --location \
-            --retry 5 \
-            --retry-delay 10 \
-            --output datasets/title.crew.tsv.gz \
-            https://datasets.imdbws.com/title.crew.tsv.gz
+          download "title.basics.tsv"
+          download "title.episode.tsv"
+          download "title.crew.tsv"
+          download "title.principals.tsv"
+          download "name.basics.tsv"
 
-          curl \
-            --fail \
-            --location \
-            --retry 5 \
-            --retry-delay 10 \
-            --output datasets/title.principals.tsv.gz \
-            https://datasets.imdbws.com/title.principals.tsv.gz
-
-          curl \
-            --fail \
-            --location \
-            --retry 5 \
-            --retry-delay 10 \
-            --output datasets/name.basics.tsv.gz \
-            https://datasets.imdbws.com/name.basics.tsv.gz
-
-          echo "Downloaded datasets:"
+          echo "Downloaded files:"
           du -h datasets/*
 
-      - name: Build episode JSON files
+      - name: Build episode shards
         shell: bash
         run: |
           set -euo pipefail
@@ -88,30 +68,30 @@ jobs:
           import datetime
           import gzip
           import json
-          import os
           import shutil
           import sqlite3
-          from functools import lru_cache
           from pathlib import Path
 
 
           DATASET_DIRECTORY = Path("datasets")
           OUTPUT_DIRECTORY = Path("out")
-          EPISODE_OUTPUT_DIRECTORY = OUTPUT_DIRECTORY / "episodes"
+          EPISODE_DIRECTORY = OUTPUT_DIRECTORY / "episodes"
           DATABASE_PATH = Path("episodes-build.sqlite3")
 
           CAST_LIMIT = 3
-          BATCH_SIZE = 25_000
+          DATABASE_BATCH_SIZE = 25_000
+          NAME_QUERY_BATCH_SIZE = 800
 
 
-          def nullable_text(value):
-              if value is None or value == r"\N" or value == "":
+          def clean_text(value):
+              if value in (None, "", r"\N"):
                   return None
+
               return value
 
 
-          def nullable_int(value):
-              value = nullable_text(value)
+          def clean_int(value):
+              value = clean_text(value)
 
               if value is None:
                   return None
@@ -122,12 +102,8 @@ jobs:
                   return None
 
 
-          def parse_boolean(value):
-              return value == "1"
-
-
           def parse_genres(value):
-              value = nullable_text(value)
+              value = clean_text(value)
 
               if value is None:
                   return []
@@ -140,7 +116,7 @@ jobs:
 
 
           def parse_ids(value):
-              value = nullable_text(value)
+              value = clean_text(value)
 
               if value is None:
                   return []
@@ -152,7 +128,7 @@ jobs:
               ]
 
 
-          def compact_json(value):
+          def encode_json(value):
               return json.dumps(
                   value,
                   ensure_ascii=False,
@@ -160,26 +136,32 @@ jobs:
               )
 
 
-          def open_tsv_gzip(path):
-              file_handle = gzip.open(
-                  path,
+          def open_dataset(filename):
+              handle = gzip.open(
+                  DATASET_DIRECTORY / filename,
                   mode="rt",
                   encoding="utf-8",
                   newline=""
               )
 
-              return file_handle, csv.DictReader(
-                  file_handle,
+              reader = csv.DictReader(
+                  handle,
                   delimiter="\t"
               )
 
+              return handle, reader
 
-          def reset_output():
+
+          def reset_build():
               if OUTPUT_DIRECTORY.exists():
                   shutil.rmtree(OUTPUT_DIRECTORY)
 
-              OUTPUT_DIRECTORY.mkdir(parents=True, exist_ok=True)
-              EPISODE_OUTPUT_DIRECTORY.mkdir(
+              OUTPUT_DIRECTORY.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
+
+              EPISODE_DIRECTORY.mkdir(
                   parents=True,
                   exist_ok=True
               )
@@ -189,14 +171,28 @@ jobs:
 
 
           def create_database():
-              connection = sqlite3.connect(DATABASE_PATH)
+              connection = sqlite3.connect(
+                  DATABASE_PATH,
+                  timeout=120
+              )
 
-              # سرعت بیشتر در مرحله ساخت دیتابیس موقت
-              connection.execute("PRAGMA journal_mode = OFF")
-              connection.execute("PRAGMA synchronous = OFF")
-              connection.execute("PRAGMA temp_store = MEMORY")
-              connection.execute("PRAGMA cache_size = -300000")
-              connection.execute("PRAGMA locking_mode = EXCLUSIVE")
+              connection.execute(
+                  "PRAGMA journal_mode = OFF"
+              )
+
+              connection.execute(
+                  "PRAGMA synchronous = OFF"
+              )
+
+              connection.execute(
+                  "PRAGMA temp_store = MEMORY"
+              )
+
+              connection.execute(
+                  "PRAGMA cache_size = -250000"
+              )
+
+              # locking_mode=EXCLUSIVE عمداً استفاده نشده است.
 
               connection.execute("""
                   CREATE TABLE episodes (
@@ -230,15 +226,16 @@ jobs:
 
 
           def load_episodes(connection):
-              print("Loading tvEpisode rows from title.basics...")
+              print(
+                  "Loading tvEpisode rows from "
+                  "title.basics..."
+              )
 
-              path = DATASET_DIRECTORY / "title.basics.tsv.gz"
-              handle, reader = open_tsv_gzip(path)
+              handle, reader = open_dataset(
+                  "title.basics.tsv.gz"
+              )
 
-              batch = []
-              count = 0
-
-              insert_sql = """
+              sql = """
                   INSERT OR REPLACE INTO episodes (
                       tconst,
                       title,
@@ -252,6 +249,9 @@ jobs:
                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
               """
 
+              batch = []
+              count = 0
+
               try:
                   for row in reader:
                       if row.get("titleType") != "tvEpisode":
@@ -261,25 +261,38 @@ jobs:
 
                       batch.append((
                           title_id,
-                          nullable_text(row.get("primaryTitle")) or title_id,
-                          nullable_text(row.get("originalTitle")),
-                          1 if parse_boolean(row.get("isAdult")) else 0,
-                          nullable_int(row.get("startYear")),
-                          nullable_int(row.get("endYear")),
-                          nullable_int(row.get("runtimeMinutes")),
-                          compact_json(parse_genres(row.get("genres")))
+                          clean_text(
+                              row.get("primaryTitle")
+                          ) or title_id,
+                          clean_text(
+                              row.get("originalTitle")
+                          ),
+                          1 if row.get("isAdult") == "1" else 0,
+                          clean_int(row.get("startYear")),
+                          clean_int(row.get("endYear")),
+                          clean_int(
+                              row.get("runtimeMinutes")
+                          ),
+                          encode_json(
+                              parse_genres(
+                                  row.get("genres")
+                              )
+                          )
                       ))
 
-                      if len(batch) >= BATCH_SIZE:
-                          connection.executemany(insert_sql, batch)
+                      if len(batch) >= DATABASE_BATCH_SIZE:
+                          connection.executemany(sql, batch)
                           count += len(batch)
                           batch.clear()
 
                           if count % 250_000 == 0:
-                              print(f"  Episodes loaded: {count:,}")
+                              print(
+                                  f"  Episodes loaded: "
+                                  f"{count:,}"
+                              )
 
                   if batch:
-                      connection.executemany(insert_sql, batch)
+                      connection.executemany(sql, batch)
                       count += len(batch)
 
                   connection.commit()
@@ -288,19 +301,21 @@ jobs:
                   handle.close()
 
               print(f"Loaded {count:,} episodes.")
+
               return count
 
 
           def load_episode_relations(connection):
-              print("Loading parent, season and episode numbers...")
+              print(
+                  "Loading parent, season and "
+                  "episode numbers..."
+              )
 
-              path = DATASET_DIRECTORY / "title.episode.tsv.gz"
-              handle, reader = open_tsv_gzip(path)
+              handle, reader = open_dataset(
+                  "title.episode.tsv.gz"
+              )
 
-              batch = []
-              processed = 0
-
-              update_sql = """
+              sql = """
                   UPDATE episodes
                   SET
                       parent_id = ?,
@@ -309,29 +324,38 @@ jobs:
                   WHERE tconst = ?
               """
 
+              batch = []
+              count = 0
+
               try:
                   for row in reader:
                       batch.append((
-                          nullable_text(row.get("parentTconst")),
-                          nullable_int(row.get("seasonNumber")),
-                          nullable_int(row.get("episodeNumber")),
+                          clean_text(
+                              row.get("parentTconst")
+                          ),
+                          clean_int(
+                              row.get("seasonNumber")
+                          ),
+                          clean_int(
+                              row.get("episodeNumber")
+                          ),
                           row["tconst"]
                       ))
 
-                      if len(batch) >= BATCH_SIZE:
-                          connection.executemany(update_sql, batch)
-                          processed += len(batch)
+                      if len(batch) >= DATABASE_BATCH_SIZE:
+                          connection.executemany(sql, batch)
+                          count += len(batch)
                           batch.clear()
 
-                          if processed % 250_000 == 0:
+                          if count % 250_000 == 0:
                               print(
-                                  f"  Episode relations processed: "
-                                  f"{processed:,}"
+                                  "  Episode relations "
+                                  f"processed: {count:,}"
                               )
 
                   if batch:
-                      connection.executemany(update_sql, batch)
-                      processed += len(batch)
+                      connection.executemany(sql, batch)
+                      count += len(batch)
 
                   connection.commit()
 
@@ -339,20 +363,22 @@ jobs:
                   handle.close()
 
               print(
-                  f"Processed {processed:,} episode relation rows."
+                  f"Processed {count:,} "
+                  "episode relation rows."
               )
 
 
           def load_crew(connection):
-              print("Loading episode directors and writers...")
+              print(
+                  "Loading episode directors "
+                  "and writers..."
+              )
 
-              path = DATASET_DIRECTORY / "title.crew.tsv.gz"
-              handle, reader = open_tsv_gzip(path)
+              handle, reader = open_dataset(
+                  "title.crew.tsv.gz"
+              )
 
-              batch = []
-              processed = 0
-
-              update_sql = """
+              sql = """
                   UPDATE episodes
                   SET
                       directors = ?,
@@ -360,103 +386,110 @@ jobs:
                   WHERE tconst = ?
               """
 
+              batch = []
+              count = 0
+
               try:
                   for row in reader:
-                      title_id = row["tconst"]
-                      directors = parse_ids(row.get("directors"))
-                      writers = parse_ids(row.get("writers"))
-
                       batch.append((
-                          compact_json(directors),
-                          compact_json(writers),
-                          title_id
+                          encode_json(
+                              parse_ids(
+                                  row.get("directors")
+                              )
+                          ),
+                          encode_json(
+                              parse_ids(
+                                  row.get("writers")
+                              )
+                          ),
+                          row["tconst"]
                       ))
 
-                      if len(batch) >= BATCH_SIZE:
-                          connection.executemany(update_sql, batch)
-                          processed += len(batch)
+                      if len(batch) >= DATABASE_BATCH_SIZE:
+                          connection.executemany(sql, batch)
+                          count += len(batch)
                           batch.clear()
 
-                          if processed % 500_000 == 0:
+                          if count % 500_000 == 0:
                               print(
                                   f"  Crew rows processed: "
-                                  f"{processed:,}"
+                                  f"{count:,}"
                               )
 
                   if batch:
-                      connection.executemany(update_sql, batch)
-                      processed += len(batch)
+                      connection.executemany(sql, batch)
+                      count += len(batch)
 
                   connection.commit()
 
               finally:
                   handle.close()
 
-              print(f"Processed {processed:,} crew rows.")
+              print(
+                  f"Processed {count:,} crew rows."
+              )
 
 
           def load_cast(connection):
               print(
-                  f"Loading top {CAST_LIMIT} cast members "
-                  f"for each episode..."
+                  f"Loading top {CAST_LIMIT} cast "
+                  "members for each episode..."
               )
 
-              path = (
-                  DATASET_DIRECTORY /
+              handle, reader = open_dataset(
                   "title.principals.tsv.gz"
               )
 
-              handle, reader = open_tsv_gzip(path)
-
-              current_title_id = None
-              current_cast = []
-              update_batch = []
-              processed_titles = 0
-
-              update_sql = """
+              sql = """
                   UPDATE episodes
                   SET actors = ?
                   WHERE tconst = ?
               """
 
-              def flush_current_title():
-                  nonlocal current_title_id
-                  nonlocal current_cast
-                  nonlocal processed_titles
+              current_title_id = None
+              current_cast = []
+
+              update_batch = []
+              title_count = 0
+
+
+              def save_current_title():
+                  nonlocal title_count
 
                   if current_title_id is None:
                       return
 
-                  # بر اساس ordering مرتب می‌شود و فقط ۳ نفر اول می‌مانند.
-                  ordered_cast = sorted(
+                  selected_cast = sorted(
                       current_cast,
                       key=lambda item: item[0]
                   )[:CAST_LIMIT]
 
                   actor_ids = [
                       person_id
-                      for _, person_id in ordered_cast
+                      for _, person_id in selected_cast
                   ]
 
                   update_batch.append((
-                      compact_json(actor_ids),
+                      encode_json(actor_ids),
                       current_title_id
                   ))
 
-                  processed_titles += 1
+                  title_count += 1
 
-                  if len(update_batch) >= BATCH_SIZE:
+                  if len(update_batch) >= DATABASE_BATCH_SIZE:
                       connection.executemany(
-                          update_sql,
+                          sql,
                           update_batch
                       )
+
                       update_batch.clear()
 
-                      if processed_titles % 250_000 == 0:
+                      if title_count % 250_000 == 0:
                           print(
-                              f"  Principal titles processed: "
-                              f"{processed_titles:,}"
+                              "  Principal titles "
+                              f"processed: {title_count:,}"
                           )
+
 
               try:
                   for row in reader:
@@ -466,7 +499,8 @@ jobs:
                           current_title_id = title_id
 
                       elif title_id != current_title_id:
-                          flush_current_title()
+                          save_current_title()
+
                           current_title_id = title_id
                           current_cast = []
 
@@ -482,14 +516,14 @@ jobs:
                       if len(current_cast) >= CAST_LIMIT:
                           continue
 
-                      person_id = nullable_text(
+                      person_id = clean_text(
                           row.get("nconst")
                       )
 
                       if person_id is None:
                           continue
 
-                      ordering = nullable_int(
+                      ordering = clean_int(
                           row.get("ordering")
                       )
 
@@ -501,11 +535,11 @@ jobs:
                           person_id
                       ))
 
-                  flush_current_title()
+                  save_current_title()
 
                   if update_batch:
                       connection.executemany(
-                          update_sql,
+                          sql,
                           update_batch
                       )
 
@@ -515,21 +549,19 @@ jobs:
                   handle.close()
 
               print(
-                  f"Processed principals for "
-                  f"{processed_titles:,} titles."
+                  "Processed principals for "
+                  f"{title_count:,} titles."
               )
 
 
           def load_names(connection):
               print("Loading IMDb person names...")
 
-              path = DATASET_DIRECTORY / "name.basics.tsv.gz"
-              handle, reader = open_tsv_gzip(path)
+              handle, reader = open_dataset(
+                  "name.basics.tsv.gz"
+              )
 
-              batch = []
-              count = 0
-
-              insert_sql = """
+              sql = """
                   INSERT OR REPLACE INTO names (
                       nconst,
                       primary_name
@@ -537,45 +569,48 @@ jobs:
                   VALUES (?, ?)
               """
 
+              batch = []
+              count = 0
+
               try:
                   for row in reader:
-                      person_id = nullable_text(
+                      person_id = clean_text(
                           row.get("nconst")
                       )
 
                       if person_id is None:
                           continue
 
-                      person_name = nullable_text(
+                      person_name = clean_text(
                           row.get("primaryName")
-                      )
-
-                      if person_name is None:
-                          person_name = person_id
+                      ) or person_id
 
                       batch.append((
                           person_id,
                           person_name
                       ))
 
-                      if len(batch) >= BATCH_SIZE:
+                      if len(batch) >= DATABASE_BATCH_SIZE:
                           connection.executemany(
-                              insert_sql,
+                              sql,
                               batch
                           )
+
                           count += len(batch)
                           batch.clear()
 
                           if count % 500_000 == 0:
                               print(
-                                  f"  Names loaded: {count:,}"
+                                  f"  Names loaded: "
+                                  f"{count:,}"
                               )
 
                   if batch:
                       connection.executemany(
-                          insert_sql,
+                          sql,
                           batch
                       )
+
                       count += len(batch)
 
                   connection.commit()
@@ -586,66 +621,77 @@ jobs:
               print(f"Loaded {count:,} names.")
 
 
-          def write_episode_files(connection):
-              print("Writing episode JSON files...")
+          def get_shard_id(title_id):
+              # tt1234567 -> 1234
+              numeric_part = title_id[2:]
 
-              # اتصال دوم برای جست‌وجوی نام اشخاص
-              names_connection = sqlite3.connect(
-                  DATABASE_PATH
+              return numeric_part[:4].ljust(4, "0")
+
+
+          def get_shard_path(shard_id):
+              # shard 1234 -> episodes/12/1234.json
+              directory = (
+                  EPISODE_DIRECTORY /
+                  shard_id[:2]
               )
 
-              @lru_cache(maxsize=250_000)
-              def get_person_name(person_id):
-                  result = names_connection.execute(
-                      """
-                      SELECT primary_name
-                      FROM names
-                      WHERE nconst = ?
-                      """,
-                      (person_id,)
-                  ).fetchone()
+              directory.mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
 
-                  if result is None:
-                      return person_id
-
-                  return result[0]
+              return directory / f"{shard_id}.json"
 
 
-              def make_people(person_ids):
-                  return [
-                      {
-                          "id": person_id,
-                          "name": get_person_name(person_id)
-                      }
-                      for person_id in person_ids
+          def load_people_names(connection, person_ids):
+              unique_ids = list(set(person_ids))
+              names = {}
+
+              for start in range(
+                  0,
+                  len(unique_ids),
+                  NAME_QUERY_BATCH_SIZE
+              ):
+                  batch = unique_ids[
+                      start:
+                      start + NAME_QUERY_BATCH_SIZE
                   ]
 
+                  if not batch:
+                      continue
 
-              select_sql = """
-                  SELECT
-                      tconst,
-                      title,
-                      original_title,
-                      is_adult,
-                      start_year,
-                      end_year,
-                      runtime,
-                      genres,
-                      parent_id,
-                      season_number,
-                      episode_number,
-                      directors,
-                      writers,
-                      actors
-                  FROM episodes
-                  ORDER BY tconst
-              """
+                  placeholders = ",".join(
+                      "?"
+                      for _ in batch
+                  )
 
-              count = 0
+                  query = f"""
+                      SELECT nconst, primary_name
+                      FROM names
+                      WHERE nconst IN ({placeholders})
+                  """
 
-              cursor = connection.execute(select_sql)
+                  for person_id, person_name in (
+                      connection.execute(query, batch)
+                  ):
+                      names[person_id] = person_name
 
-              for row in cursor:
+              return names
+
+
+          def write_shard(
+              connection,
+              shard_id,
+              rows
+          ):
+              if not rows:
+                  return 0
+
+              all_person_ids = []
+
+              parsed_rows = []
+
+              for row in rows:
                   (
                       title_id,
                       title,
@@ -675,7 +721,67 @@ jobs:
                       actors_json or "[]"
                   )[:CAST_LIMIT]
 
-                  episode_data = {
+                  all_person_ids.extend(directors)
+                  all_person_ids.extend(writers)
+                  all_person_ids.extend(actors)
+
+                  parsed_rows.append((
+                      title_id,
+                      title,
+                      original_title,
+                      is_adult,
+                      start_year,
+                      end_year,
+                      runtime,
+                      json.loads(genres_json or "[]"),
+                      parent_id,
+                      season_number,
+                      episode_number,
+                      directors,
+                      writers,
+                      actors
+                  ))
+
+              people_names = load_people_names(
+                  connection,
+                  all_person_ids
+              )
+
+
+              def make_people(person_ids):
+                  return [
+                      {
+                          "id": person_id,
+                          "name": people_names.get(
+                              person_id,
+                              person_id
+                          )
+                      }
+                      for person_id in person_ids
+                  ]
+
+
+              output = {}
+
+              for row in parsed_rows:
+                  (
+                      title_id,
+                      title,
+                      original_title,
+                      is_adult,
+                      start_year,
+                      end_year,
+                      runtime,
+                      genres,
+                      parent_id,
+                      season_number,
+                      episode_number,
+                      directors,
+                      writers,
+                      actors
+                  ) = row
+
+                  output[title_id] = {
                       "id": title_id,
                       "title": title,
                       "originalTitle": original_title,
@@ -684,123 +790,205 @@ jobs:
                       "startYear": start_year,
                       "endYear": end_year,
                       "runtime": runtime,
-                      "genres": json.loads(
-                          genres_json or "[]"
-                      ),
+                      "genres": genres,
                       "parentId": parent_id,
                       "seasonNumber": season_number,
                       "episodeNumber": episode_number,
-                      "directors": make_people(directors),
-                      "writers": make_people(writers),
-                      "actors": make_people(actors)
+                      "directors": make_people(
+                          directors
+                      ),
+                      "writers": make_people(
+                          writers
+                      ),
+                      "actors": make_people(
+                          actors
+                      )
                   }
 
-                  # مثال:
-                  # tt1234567 -> episodes/12/tt1234567.json
-                  shard = title_id[2:4]
+              output_path = get_shard_path(shard_id)
 
-                  shard_directory = (
-                      EPISODE_OUTPUT_DIRECTORY /
-                      shard
-                  )
-
-                  shard_directory.mkdir(
-                      parents=True,
-                      exist_ok=True
-                  )
-
-                  output_path = (
-                      shard_directory /
-                      f"{title_id}.json"
-                  )
-
-                  with output_path.open(
-                      "w",
-                      encoding="utf-8"
-                  ) as output_file:
-                      json.dump(
-                          episode_data,
-                          output_file,
-                          ensure_ascii=False,
-                          separators=(",", ":")
-                      )
-
-                  count += 1
-
-                  if count % 100_000 == 0:
-                      print(
-                          f"  Episode files written: "
-                          f"{count:,}"
-                      )
-
-              names_connection.close()
-
-              print(
-                  f"Finished writing {count:,} episode files."
+              temporary_path = output_path.with_suffix(
+                  ".json.tmp"
               )
 
-              return count
+              with temporary_path.open(
+                  "w",
+                  encoding="utf-8"
+              ) as output_file:
+                  json.dump(
+                      output,
+                      output_file,
+                      ensure_ascii=False,
+                      separators=(",", ":")
+                  )
+
+              temporary_path.replace(output_path)
+
+              return len(output)
 
 
-          def write_version_file(episode_count):
+          def write_episode_shards(connection):
+              print("Writing episode shard files...")
+
+              query = """
+                  SELECT
+                      tconst,
+                      title,
+                      original_title,
+                      is_adult,
+                      start_year,
+                      end_year,
+                      runtime,
+                      genres,
+                      parent_id,
+                      season_number,
+                      episode_number,
+                      directors,
+                      writers,
+                      actors
+                  FROM episodes
+                  ORDER BY tconst
+              """
+
+              cursor = connection.execute(query)
+
+              current_shard_id = None
+              current_rows = []
+
+              episode_count = 0
+              shard_count = 0
+
+              for row in cursor:
+                  title_id = row[0]
+                  shard_id = get_shard_id(title_id)
+
+                  if current_shard_id is None:
+                      current_shard_id = shard_id
+
+                  elif shard_id != current_shard_id:
+                      written = write_shard(
+                          connection,
+                          current_shard_id,
+                          current_rows
+                      )
+
+                      episode_count += written
+                      shard_count += 1
+
+                      if shard_count % 100 == 0:
+                          print(
+                              f"  Shards written: "
+                              f"{shard_count:,}; "
+                              f"episodes: "
+                              f"{episode_count:,}"
+                          )
+
+                      current_shard_id = shard_id
+                      current_rows = []
+
+                  current_rows.append(row)
+
+              if current_rows:
+                  written = write_shard(
+                      connection,
+                      current_shard_id,
+                      current_rows
+                  )
+
+                  episode_count += written
+                  shard_count += 1
+
+              print(
+                  f"Finished writing "
+                  f"{episode_count:,} episodes "
+                  f"into {shard_count:,} shards."
+              )
+
+              return episode_count, shard_count
+
+
+          def write_version_file(
+              episode_count,
+              shard_count
+          ):
               version_data = {
                   "updated": datetime.datetime.now(
                       datetime.timezone.utc
                   ).isoformat(),
                   "episodes": episode_count,
+                  "shards": shard_count,
                   "castLimit": CAST_LIMIT,
-                  "formatVersion": 1
+                  "formatVersion": 2,
+                  "shardStrategy": "tconst[2:6]",
+                  "pathPattern": (
+                      "episodes/{prefix}/"
+                      "{shard}.json"
+                  )
               }
 
-              version_path = (
+              with (
                   OUTPUT_DIRECTORY /
                   "version.json"
-              )
-
-              with version_path.open(
+              ).open(
                   "w",
                   encoding="utf-8"
-              ) as version_file:
+              ) as output_file:
                   json.dump(
                       version_data,
-                      version_file,
+                      output_file,
                       ensure_ascii=False,
                       separators=(",", ":")
                   )
 
 
           def main():
-              reset_output()
+              reset_build()
 
               connection = create_database()
 
               try:
-                  episode_count = load_episodes(connection)
+                  expected_episode_count = load_episodes(
+                      connection
+                  )
 
                   load_episode_relations(connection)
                   load_crew(connection)
                   load_cast(connection)
                   load_names(connection)
 
-                  written_count = write_episode_files(
-                      connection
+                  episode_count, shard_count = (
+                      write_episode_shards(connection)
                   )
 
-                  if written_count != episode_count:
+                  if (
+                      episode_count !=
+                      expected_episode_count
+                  ):
                       raise RuntimeError(
                           "Episode count mismatch: "
-                          f"database={episode_count}, "
-                          f"written={written_count}"
+                          f"database="
+                          f"{expected_episode_count:,}, "
+                          f"output={episode_count:,}"
                       )
 
-                  write_version_file(written_count)
+                  write_version_file(
+                      episode_count,
+                      shard_count
+                  )
 
               finally:
                   connection.close()
 
               print("Build completed successfully.")
-              print(f"Episodes: {episode_count:,}")
-              print(f"Cast limit: {CAST_LIMIT}")
+              print(
+                  f"Episodes: {episode_count:,}"
+              )
+              print(
+                  f"Shards: {shard_count:,}"
+              )
+              print(
+                  f"Cast limit: {CAST_LIMIT}"
+              )
 
 
           if __name__ == "__main__":
@@ -812,22 +1000,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Version:"
+          echo "Version information:"
           cat out/version.json
           echo
 
           echo "Output size:"
           du -sh out
 
-          echo "Number of episode files:"
+          echo "Number of shard files:"
           find out/episodes -type f -name '*.json' | wc -l
 
-          echo "Example files:"
-          find out/episodes -type f -name '*.json' | head -n 5 || true
+          echo "Example shard files:"
+          find out/episodes -type f -name '*.json' | head -n 10 || true
 
+          echo "Disk information:"
           df -h
 
-      - name: Remove temporary files
+      - name: Remove temporary build files
         shell: bash
         run: |
           set -euo pipefail
@@ -836,35 +1025,33 @@ jobs:
           rm -f episodes-build.sqlite3
           rm -f episodes-build.sqlite3-shm
           rm -f episodes-build.sqlite3-wal
+          rm -f episodes-build.sqlite3-journal
 
           df -h
 
-      - name: Deploy episodes to gh-pages
+      - name: Deploy episodes
         shell: bash
         run: |
           set -euo pipefail
 
-          git config user.name "bot"
-          git config user.email "bot@bot.com"
+          git config user.name "IMDb Episodes Bot"
+          git config user.email "bot@users.noreply.github.com"
 
           git checkout --orphan gh-pages
 
-          # حذف فایل‌های track‌شده شاخه اصلی
           git rm -rf . || true
 
-          # فقط خروجی اپیزودها وارد gh-pages می‌شود
           mv out/episodes ./episodes
           mv out/version.json ./version.json
 
           rm -rf out
 
-          # جلوگیری از پردازش فایل‌ها توسط Jekyll
           touch .nojekyll
 
           git add episodes version.json .nojekyll
 
           git commit \
-            -m "Update IMDb episodes with top 3 cast"
+            -m "Update IMDb episode shards"
 
           git push \
             --force \
