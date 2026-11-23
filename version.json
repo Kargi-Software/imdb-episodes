@@ -1,0 +1,1 @@
+{"updated":"2026-11-23T11:30:50.819865+00:00","episodes":10063257,"series":244927,"formatVersion":4,"shardStrategy":"parentId","valueShape":"id -> title (string only)","pathPattern":"episodes/{prefix}/{seriesId}.json"}
